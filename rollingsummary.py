@@ -10,6 +10,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 app = Flask(__name__)
 scrape_threads = {}
 
+def strip_think_tags(text):
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
 def extract_json_content(text: str):
     text = re.sub(r'^```(?:json)?|```$', '', text.strip(), flags=re.IGNORECASE).strip()
     try:
@@ -49,7 +52,6 @@ def generate_overall_report(account_name, summary_path, output_path):
     )
     summaries_str = "\n\n".join(f"Summary:\n{entry['summary']}" for entry in summaries)
     messages = [
-        {"role": "system", "content": ""},
         {"role": "user", "content": prompt + summaries_str}
     ]
     payload = {
@@ -70,17 +72,9 @@ def generate_overall_report(account_name, summary_path, output_path):
     except Exception as e:
         print(f"[REPORT ERROR] Failed to generate meta summary: {e}")
 
-def scrape_and_comment(
-    account_name: str,
-    model: str = "deepseek-r1-distill-llama-8b-abliterated",
-    api_url: str = "http://127.0.0.1:1234/v1/chat/completions",
-    rolling_context_length: int = 10,
-    total_scrolls: int = 50,
-    scroll_delay: float = 2.5,
-):
+def scrape_and_comment(account_name: str, model: str = "deepseek-r1-distill-llama-8b-abliterated", api_url: str = "http://127.0.0.1:1234/v1/chat/completions", rolling_context_length: int = 10, total_scrolls: int = 50, scroll_delay: float = 2.5):
     subfolder = Path(account_name)
     subfolder.mkdir(parents=True, exist_ok=True)
-
     tweet_file = subfolder / "tweets.jsonl"
     commentary_file = subfolder / "commentary.jsonl"
     summary_file = subfolder / "summary.jsonl"
@@ -91,11 +85,10 @@ def scrape_and_comment(
     summary_file.touch(exist_ok=True)
 
     x_replies_url = f"https://x.com/{account_name}/with_replies"
-    context = [{"role": "system", "content": ""}]
+    context = [{"role": "user", "content": ""}]
     summary_prompt = (
-        "Please produce a concise summary report of the following block "
-        "of tweets and commentary. Highlight major themes, recurring patterns, and insights. "
-        "Your summary should be clear, darkly witty, and provide context for individuals and the overall narrative."
+        "The following tweets are from a public account, arranged in chronological order. Write a single narrative paragraph that captures shifts in tone, rhetorical strategy, and attention. "
+        "Highlight bias, contradictions, or strategic intent. Avoid listing or rephrasing each tweet. This should feel like you're tracing a person's thinking or narrative arc over time.\n\n"
     )
 
     seen_timestamps = set()
@@ -161,7 +154,7 @@ def scrape_and_comment(
                         tf.write(json.dumps(tweet_dict, ensure_ascii=False) + "\n")
                     total_collected += 1
 
-                    user_msg = f"@{from_user or 'someone'} tweeted: {content}. Summarize it in context. Use <think>thoughts</think> tags before responding."
+                    user_msg = f"[{timestamp}] Tweet from @{from_user or 'someone'}:\n{content}\nWrite a brief psychological or strategic interpretation."
                     context.append({"role": "user", "content": user_msg})
                     if len(context) > (rolling_context_length + 1):
                         context = [context[0]] + context[-rolling_context_length:]
@@ -169,8 +162,8 @@ def scrape_and_comment(
                     payload = {
                         "model": model,
                         "messages": context,
-                        "temperature": 0.7,
-                        "max_tokens": 2048,
+                        "temperature": 0.8,
+                        "max_tokens": 1024,
                         "stream": False
                     }
 
@@ -191,13 +184,13 @@ def scrape_and_comment(
                     block_tweets.append(out_dict)
 
                     if len(block_tweets) >= 10:
+                        block_tweets.sort(key=lambda x: x["timestamp"])
                         summary_prompt_block = summary_prompt + "\n\n" + "\n\n".join(
-                            f"Tweet from @{item['from_user']} at {item['timestamp']}:\n{item['content']}\nCommentary:\n{item['llm_commentary']}"
+                            f"[{item['timestamp']}] @{item['from_user']} tweeted:\n{item['content']}\nLLM Commentary:\n{strip_think_tags(item['llm_commentary'])}"
                             for item in block_tweets)
                         summary_payload = {
                             "model": model,
                             "messages": [
-                                {"role": "system", "content": ""},
                                 {"role": "user", "content": summary_prompt_block}
                             ],
                             "temperature": 0.7,
@@ -256,14 +249,18 @@ def feed(account_name):
     feed_data, summaries = [], []
     with commentary_file.open("r", encoding="utf-8") as cf:
         for line in cf:
-            try: feed_data.append(json.loads(line))
-            except: continue
+            try:
+                feed_data.append(json.loads(line))
+            except:
+                continue
 
     if summary_file.exists():
         with summary_file.open("r", encoding="utf-8") as sf:
             for line in sf:
-                try: summaries.append(json.loads(line))
-                except: continue
+                try:
+                    summaries.append(json.loads(line))
+                except:
+                    continue
 
     feed_data.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     summaries.sort(key=lambda x: x.get("generated_at", ""))
@@ -273,15 +270,18 @@ def feed(account_name):
 
     return render_template_string("""
     <html><body><h1>{{account_name}}</h1>
+    {% if live == "1" %}
+        <p><i>Scraping in progress...</i></p>
+    {% endif %}
     {% for item in feed_data %}
-    <div><b>@{{item.from_user}}</b>: {{item.content}}<br><i>{{item.llm_commentary}}</i></div>
+    <div><b>[{{item.timestamp}}] @{{item.from_user}}</b>: {{item.content}}<br><i>{{ strip_think_tags(item.llm_commentary) }}</i></div>
     {% endfor %}
     <hr>
     {% for sum in summaries %}
-    <div><b>Summary Block:</b><br>{{sum.summary}}</div>
+    <div><b>Summary Block ({{sum.block_tweets[0]}} → {{sum.block_tweets[-1]}}):</b><br>{{sum.summary}}</div>
     {% endfor %}
     </body></html>
-    """, account_name=account_name, feed_data=feed_data, summaries=summaries, live=live)
+    """, account_name=account_name, feed_data=feed_data, summaries=summaries, live=live, strip_think_tags=strip_think_tags)
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000, use_reloader=False)
