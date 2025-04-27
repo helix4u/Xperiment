@@ -4,6 +4,7 @@ import threading
 import signal
 import sys
 from pathlib import Path
+from datetime import datetime
 from flask import Flask, request, redirect, url_for, render_template_string
 from playwright.sync_api import sync_playwright
 
@@ -11,7 +12,6 @@ app = Flask(__name__)
 scrape_threads = {}
 browser_contexts = {}
 
-# Handle termination signals
 def signal_handler(sig, frame):
     print("[INFO] Shutting down and cleaning up browser processes...")
     for acct, ctx in browser_contexts.items():
@@ -26,21 +26,16 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def scrape_tweets(account_name: str, total_scrolls: int = 100):
+    # Generate timestamp for this run
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     subfolder = Path(account_name)
     subfolder.mkdir(parents=True, exist_ok=True)
-    tweet_file = subfolder / "tweets.jsonl"
+    tweet_file = subfolder / f"tweets_{ts_str}.jsonl"
     tweet_file.touch(exist_ok=True)
-    seen_ids = set()
-    # Load already seen IDs
-    with tweet_file.open("r", encoding="utf-8") as tf:
-        for line in tf:
-            try:
-                data = json.loads(line)
-                if "id" in data:
-                    seen_ids.add(data["id"])
-            except:
-                continue
 
+    seen_ids = set()
+    # No existing file to read from; new run
+    
     profile_dir = Path(".chromium-profile").resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
     total_collected = 0
@@ -62,7 +57,6 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
         page.wait_for_selector("article", timeout=20000, state="attached")
         time.sleep(2)
 
-        # Dismiss overlays
         try:
             page.keyboard.press("Escape")
             time.sleep(1)
@@ -72,8 +66,8 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
         for scroll in range(total_scrolls):
             print(f"[PROGRESS] Scroll {scroll+1}/{total_scrolls}")
 
-            # Expand ALL Show More buttons, capped to avoid infinite loops
             expansions = 0
+            # Keep clicking until no more Show More
             while True:
                 clicked = page.evaluate("""
                     () => {
@@ -89,17 +83,16 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
                         catch { return false; }
                     }
                 """)
-                if not clicked or expansions >= 10:
+                if not clicked or expansions >= 20:
                     break
                 expansions += 1
                 print(f"[INFO] Clicked 'Show more' ({expansions})")
                 time.sleep(2)
 
             if expansions:
-                print(f"[INFO] Completed {expansions} expansions; waiting for content to settle")
+                print(f"[INFO] Completed {expansions} expansions; waiting for load")
                 time.sleep(2)
 
-            # Scrape after ensuring all expansions
             tweets_data = page.evaluate("""
                 () => {
                     const extractText = el => el ? (el.innerText||el.textContent) : '';
@@ -112,22 +105,22 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
                     document.querySelectorAll('article').forEach(art => {
                         try {
                             let url='', user='', id='', ts='';
-                            const timeEl = art.querySelector('time');
-                            if (timeEl) {
-                                ts = timeEl.getAttribute('datetime')||'';
-                                const link = timeEl.closest('a');
+                            const tEl = art.querySelector('time');
+                            if (tEl) {
+                                ts = tEl.getAttribute('datetime')||'';
+                                const link = tEl.closest('a');
                                 if (link) {
                                     let h = link.getAttribute('href');
                                     if (h.startsWith('/')) h = 'https://x.com'+h;
-                                    url=h; user = extractUser(h)||'unknown';
-                                    const m = h.match(/status\\/(\\d+)/);
-                                    id = m?m[1]:'';
+                                    url=h; user=extractUser(h)||'unknown';
+                                    const m=h.match(/status\\/(\\d+)/);
+                                    id=m?m[1]:'';
                                 }
                             }
                             if (!url) {
                                 const alt = art.querySelector('a[href*="/status/"]');
                                 if (alt) {
-                                    let h2 = alt.getAttribute('href');
+                                    let h2=alt.getAttribute('href');
                                     if (h2.startsWith('/')) h2='https://x.com'+h2;
                                     url=h2; user=extractUser(h2)||'unknown';
                                     const m2=h2.match(/status\\/(\\d+)/);
@@ -142,18 +135,17 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
                                 retBy=m3?m3[1].trim():null;
                             }
                             if (!isRT && user.toLowerCase() !== window.location.pathname.split('/')[1].toLowerCase()) {
-                                isRT=true;
-                                retBy = window.location.pathname.split('/')[1];
+                                isRT=true; retBy=window.location.pathname.split('/')[1];
                             }
                             const mention = Array.from(art.querySelectorAll('a[role="link"]'))
-                                  .find(a=>{ const h=a.getAttribute('href')||''; return h.startsWith('/')&&!h.includes('/status/'); });
+                                .find(a=>{ const h=a.getAttribute('href')||''; return h.startsWith('/')&&!h.includes('/status/'); });
                             const mentioned = mention?mention.getAttribute('href').replace('/',''):null;
                             let text = extractText(art.querySelector('div[lang]')) ||
                                        extractText(art.querySelector('[data-testid="tweetText"]'));
                             if (!text) {
                                 for (const d of art.querySelectorAll('div[dir="auto"]')) {
                                     const t2=extractText(d).trim();
-                                    if (t2.length>5){ text=t2; break;}
+                                    if (t2.length>5){ text=t2; break; }
                                 }
                             }
                             if (!text) text=extractText(art).trim();
@@ -177,16 +169,16 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
             """)
 
             print(f"[INFO] Found {len(tweets_data)} articles")
-            new_cnt=0; rt_cnt=0
+            new_count=0; rt_count=0
             for tw in tweets_data:
                 tid=tw['id']
                 if not tid or tid in seen_ids: continue
                 seen_ids.add(tid)
                 with tweet_file.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(tw, ensure_ascii=False)+"\n")
-                new_cnt+=1; total_collected+=1
-                if tw['is_retweet']: rt_cnt+=1; total_retweets+=1
-            print(f"[INFO] Saved {new_cnt} new (including {rt_cnt} retweets)")
+                new_count+=1; total_collected+=1
+                if tw['is_retweet']: rt_count+=1; total_retweets+=1
+            print(f"[INFO] Saved {new_count} new tweets ({rt_count} retweets)")
 
             page.evaluate("window.scrollBy({top:2000,behavior:'smooth'})")
             time.sleep(2)
@@ -222,8 +214,7 @@ def index():
         acct=request.form.get("account_name","").strip()
         if acct and (acct not in scrape_threads or not scrape_threads[acct].is_alive()):
             t=threading.Thread(target=scrape_tweets,args=(acct,))
-            t.start()
-            scrape_threads[acct]=t
+            t.start(); scrape_threads[acct]=t
         return redirect(url_for("feed",account_name=acct,live="1"))
     return """<html><body>
 <form method="POST">
@@ -235,10 +226,13 @@ def index():
 @app.route("/feed/<account_name>")
 def feed(account_name):
     live=request.args.get("live","0")
-    sub=Path(account_name); tf=sub/"tweets.jsonl"
-    if not tf.exists(): return f"<p>No data for {account_name}.</p>"
+    sub=Path(account_name); tf=sub/f"tweets_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+    # We show the latest run directory contents, but file naming for reading can vary.
+    files = sorted(sub.glob("tweets_*.jsonl"))
+    if not files: return f"<p>No data for {account_name}.</p>"
+    latest = files[-1]
     tweets=[]; rts=0; errs=0
-    for ln in tf.open("r",encoding="utf-8"):
+    for ln in latest.open("r",encoding="utf-8"):
         try:
             d=json.loads(ln); tweets.append(d)
             if d.get("is_retweet"): rts+=1
