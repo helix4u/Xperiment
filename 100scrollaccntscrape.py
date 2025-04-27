@@ -12,12 +12,13 @@ app = Flask(__name__)
 scrape_threads = {}
 browser_contexts = {}
 
+# Graceful shutdown
 def signal_handler(sig, frame):
-    print("[INFO] Shutting down and cleaning up browser processes...")
-    for acct, ctx in browser_contexts.items():
+    print("[INFO] Shutting down browsers...")
+    for key, ctx in browser_contexts.items():
         try:
             ctx.close()
-            print(f"[INFO] Closed browser for {acct}")
+            print(f"[INFO] Closed browser for {key}")
         except:
             pass
     sys.exit(0)
@@ -25,38 +26,42 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def scrape_tweets(account_name: str, total_scrolls: int = 100):
-    # Generate timestamp for this run
-    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    subfolder = Path(account_name)
+def scrape_tweets(account_name: str, feed_type: str, total_scrolls: int = 100):
+    # Determine folder and filename
+    folder_name = f"{account_name}_{feed_type}"
+    subfolder = Path(folder_name)
     subfolder.mkdir(parents=True, exist_ok=True)
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     tweet_file = subfolder / f"tweets_{ts_str}.jsonl"
     tweet_file.touch(exist_ok=True)
 
     seen_ids = set()
-    # No existing file to read from; new run
-    
-    profile_dir = Path(".chromium-profile").resolve()
-    profile_dir.mkdir(parents=True, exist_ok=True)
     total_collected = 0
     total_retweets = 0
 
+    # Launch browser
     playwright = sync_playwright().start()
-    browser_context = playwright.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir),
+    browser_ctx = playwright.chromium.launch_persistent_context(
+        user_data_dir=str(Path(".chromium-profile").resolve()),
         headless=False,
         args=["--disable-blink-features=AutomationControlled"]
     )
-    browser_contexts[account_name] = browser_context
-    page = browser_context.pages[0] if browser_context.pages else browser_context.new_page()
+    browser_contexts[folder_name] = browser_ctx
+    page = browser_ctx.pages[0] if browser_ctx.pages else browser_ctx.new_page()
 
     try:
-        url = f"https://x.com/{account_name}/with_replies"
+        # Choose URL
+        if feed_type == "home":
+            url = "https://x.com/home"
+        else:
+            url = f"https://x.com/{account_name}/with_replies"
+
         print(f"[INFO] Opening {url}")
         page.goto(url, timeout=20000)
-        page.wait_for_selector("article", timeout=20000, state="attached")
+        page.wait_for_selector("article", timeout=20000)
         time.sleep(2)
 
+        # Dismiss overlays
         try:
             page.keyboard.press("Escape")
             time.sleep(1)
@@ -66,8 +71,8 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
         for scroll in range(total_scrolls):
             print(f"[PROGRESS] Scroll {scroll+1}/{total_scrolls}")
 
+            # Expand Show More buttons until none remain
             expansions = 0
-            # Keep clicking until no more Show More
             while True:
                 clicked = page.evaluate("""
                     () => {
@@ -90,9 +95,10 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
                 time.sleep(2)
 
             if expansions:
-                print(f"[INFO] Completed {expansions} expansions; waiting for load")
+                print(f"[INFO] Completed {expansions} expansions; waiting for content")
                 time.sleep(2)
 
+            # Extract tweets
             tweets_data = page.evaluate("""
                 () => {
                     const extractText = el => el ? (el.innerText||el.textContent) : '';
@@ -169,16 +175,18 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
             """)
 
             print(f"[INFO] Found {len(tweets_data)} articles")
-            new_count=0; rt_count=0
+            new_cnt=0; rt_cnt=0
             for tw in tweets_data:
-                tid=tw['id']
-                if not tid or tid in seen_ids: continue
+                tid = tw['id']
+                if not tid or tid in seen_ids:
+                    continue
                 seen_ids.add(tid)
                 with tweet_file.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(tw, ensure_ascii=False)+"\n")
-                new_count+=1; total_collected+=1
-                if tw['is_retweet']: rt_count+=1; total_retweets+=1
-            print(f"[INFO] Saved {new_count} new tweets ({rt_count} retweets)")
+                new_cnt+=1; total_collected+=1
+                if tw['is_retweet']:
+                    rt_cnt+=1; total_retweets+=1
+            print(f"[INFO] Saved {new_cnt} new ({rt_cnt} retweets)")
 
             page.evaluate("window.scrollBy({top:2000,behavior:'smooth'})")
             time.sleep(2)
@@ -187,19 +195,16 @@ def scrape_tweets(account_name: str, total_scrolls: int = 100):
         print(f"[ERROR] Scraping failed: {e}")
 
     finally:
-        print(f"[INFO] Cleaning up browser for {account_name}")
-        if account_name in browser_contexts:
-            try: browser_contexts[account_name].close()
-            except: pass
-            del browser_contexts[account_name]
-        try: browser_context.close()
+        print(f"[INFO] Cleaning up browser for {folder_name}")
+        try: browser_ctx.close()
         except: pass
         playwright.stop()
+        browser_contexts.pop(folder_name, None)
 
     print(f"[DONE] Collected {total_collected} tweets ({total_retweets} retweets)")
 
 def cleanup_browsers():
-    print("[INFO] Flask shutting down—cleaning browsers")
+    print("[INFO] Cleaning all browsers")
     for ctx in list(browser_contexts.values()):
         try: ctx.close()
         except: pass
@@ -208,60 +213,78 @@ def cleanup_browsers():
 import atexit
 atexit.register(cleanup_browsers)
 
+# Web interface
+
 @app.route("/", methods=["GET","POST"])
 def index():
     if request.method=="POST":
-        acct=request.form.get("account_name","").strip()
-        if acct and (acct not in scrape_threads or not scrape_threads[acct].is_alive()):
-            t=threading.Thread(target=scrape_tweets,args=(acct,))
-            t.start(); scrape_threads[acct]=t
-        return redirect(url_for("feed",account_name=acct,live="1"))
-    return """<html><body>
+        acct = request.form.get("account_name","").strip()
+        feed = request.form.get("feed_type","with_replies")
+        key = f"{acct}_{feed}"
+        if acct and (key not in scrape_threads or not scrape_threads[key].is_alive()):
+            t = threading.Thread(target=scrape_tweets, args=(acct, feed))
+            t.start()
+            scrape_threads[key] = t
+        return redirect(url_for("feed", account_name=acct, feed_type=feed, live="1"))
+    return render_template_string("""
+<html><body>
 <form method="POST">
-<label>Account</label><input name="account_name" required>
-<button>Start</button>
+  <label>Account</label>
+  <input name="account_name" required placeholder="e.g. elonmusk or home">
+  <label>Feed type</label>
+  <select name="feed_type">
+    <option value="with_replies">With Replies</option>
+    <option value="home">Home Timeline</option>
+  </select>
+  <button>Start</button>
 </form>
-</body></html>"""
+</body></html>
+""")
 
-@app.route("/feed/<account_name>")
-def feed(account_name):
-    live=request.args.get("live","0")
-    sub=Path(account_name); tf=sub/f"tweets_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-    # We show the latest run directory contents, but file naming for reading can vary.
-    files = sorted(sub.glob("tweets_*.jsonl"))
-    if not files: return f"<p>No data for {account_name}.</p>"
+@app.route("/feed/<account_name>/<feed_type>")
+def feed(account_name, feed_type):
+    live = request.args.get("live","0")
+    folder = Path(f"{account_name}_{feed_type}")
+    if not folder.exists():
+        return f"<p>No data folder for {account_name} {feed_type}.</p>"
+    # pick latest file
+    files = sorted(folder.glob("tweets_*.jsonl"))
+    if not files:
+        return f"<p>No data files found in {folder.name}.</p>"
     latest = files[-1]
     tweets=[]; rts=0; errs=0
-    for ln in latest.open("r",encoding="utf-8"):
+    for ln in latest.open("r", encoding="utf-8"):
         try:
-            d=json.loads(ln); tweets.append(d)
+            d = json.loads(ln)
+            tweets.append(d)
             if d.get("is_retweet"): rts+=1
             if d.get("error"): errs+=1
-        except: continue
-    tweets.sort(key=lambda x:x.get("timestamp",""),reverse=True)
-    if account_name in scrape_threads and not scrape_threads[account_name].is_alive():
+        except:
+            continue
+    tweets.sort(key=lambda x: x.get("timestamp",""), reverse=True)
+    if f"{account_name}_{feed_type}" in scrape_threads and not scrape_threads[f"{account_name}_{feed_type}"].is_alive():
         live="0"
     return render_template_string("""
-<html><body><h1>{{account_name}}</h1>
+<html><body><h1>{{account_name}} {{feed_type}}</h1>
 {% if live=='1' %}
 <p><i>Scraping in progress... {{tweets|length}} tweets so far ({{rts}} retweets, {{errs}} errors)</i></p>
-<p><a href="{{url_for('feed',account_name=account_name,live=1)}}">Refresh</a></p>
+<p><a href="{{url_for('feed',account_name=account_name,feed_type=feed_type,live=1)}}">Refresh</a></p>
 {% else %}
 <p><i>{{tweets|length}} tweets collected ({{rts}} retweets, {{errs}} errors)</i></p>
 {% endif %}
 {% for t in tweets %}
 <div style="margin:10px;padding:10px;border:1px solid #ccc;{% if t.error %}background-color:#ffeeee;{% endif %}">
-{% if t.is_retweet %}<div style="color:#555">Retweeted by {{t.retweeted_by}}</div>{% endif %}
-{% if t.mentioned_user and t.mentioned_user!=t.username %}<div style="color:#555">Mentions: @{{t.mentioned_user}}</div>{% endif %}
+{% if t.is_retweet %}<div>Retweeted by {{t.retweeted_by}}</div>{% endif %}
+{% if t.mentioned_user and t.mentioned_user!=t.username %}<div>Mentions @{{t.mentioned_user}}</div>{% endif %}
 <b>[{{t.timestamp or 'Unknown'}}] @{{t.username}}</b>: {{t.content}}
 {% if t.tweet_url %}<p><a href="{{t.tweet_url}}" target="_blank">View on X</a></p>{% endif %}
 </div>
 {% endfor %}
 </body></html>
-""",account_name=account_name,tweets=tweets,rts=rts,errs=errs,live=live)
+""", account_name=account_name, feed_type=feed_type, tweets=tweets, rts=rts, errs=errs, live=live)
 
 if __name__=="__main__":
     try:
-        app.run(debug=True,port=5000,use_reloader=False)
+        app.run(debug=True, port=5000, use_reloader=False)
     finally:
         cleanup_browsers()
